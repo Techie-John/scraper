@@ -1,213 +1,38 @@
 # Import necessary libraries
 import gradio as gr          # For creating the web-based graphical user interface (GUI)
-import requests              # For making HTTP requests to fetch web pages
-from bs4 import BeautifulSoup # For parsing HTML and XML documents
+import requests              # For making HTTP requests to fetch web pages (used for fallback/link discovery)
+from bs4 import BeautifulSoup # For parsing HTML documents (used for generic link discovery)
 import html2text             # For converting HTML content to Markdown format
 import PyPDF2                # For extracting text from PDF files
-import re                    # For regular expressions (used for URL pattern matching)
+import re                    # For regular expressions (used for minor text cleaning and URL validation)
 import json                  # For working with JSON data (input/output format)
-from urllib.parse import urlparse, urljoin # For parsing and joining URLs
+from urllib.parse import urlparse, urljoin # For parsing, joining, and normalizing URLs
 import os                    # For operating system related functionalities (e.g., getting file basename)
 import time                  # For adding delays to be polite to web servers
+from collections import deque # For implementing a queue for URL processing
 
-# --- SECTION 1: WEBSITE CONFIGURATION RULES ---
-# This is the core of the scraper's adaptability and robustness.
-# It's a dictionary that defines how to scrape different types of content
-# from various websites.
-#
-# Structure:
-# {
-#   "domain.com": {                       # Top-level key is the normalized domain (e.g., "medium.com")
-#     "page_type_key": {                  # Inner key describes a specific type of page on that domain
-#       "url_pattern": "regex_pattern",   # Regex to match URLs belonging to this page type
-#       "scrape_type": "index_to_articles" | "single_article", # How to handle this URL
-#       "link_selector": "CSS_selector",  # (Only for "index_to_articles") Selector for links to articles
-#       "title_selector": "CSS_selector" | ["CSS_selector1", "CSS_selector2"], # Selector(s) for the article title
-#       "content_selector": "CSS_selector" | ["CSS_selector1", "CSS_selector2"],# Selector(s) for the main content
-#       "author_selector": "CSS_selector" | ["CSS_selector1", "CSS_selector2"],# Selector(s) for the author name
-#       "content_type": "blog" | "podcast_transcript" | "book" | "other" # Type for the output JSON
-#     },
-#     ... another page type config for domain.com ...
-#   },
-#   "another-domain.com": { ... }
-# }
-#
-# Robustness via List of Selectors:
-# For 'title_selector', 'content_selector', and 'author_selector', you can provide
-# a LIST of CSS selectors. The `get_element_text` and `get_element_html` helper
-# functions (defined below) will try each selector in the list IN ORDER until
-# they find a matching element. This makes the scraper resilient to minor
-# website layout changes (e.g., a class name changes, but an alternative selector still works).
-#
-# How to find CSS Selectors:
-# 1. Open the webpage in your browser.
-# 2. Right-click on the element you want to scrape (e.g., the article title, a paragraph of content).
-# 3. Select "Inspect" or "Inspect Element".
-# 4. In the browser's developer tools, find a unique CSS selector for that element.
-#    You can right-click the element in the Elements tab, then "Copy" -> "Copy selector".
-#    However, often it's better to find a more general selector (e.g., `h1`, `article`, `div.post-content`).
-WEBSITE_CONFIG = {
-    "interviewing.io": {
-        "blog_index": {
-            "url_pattern": r"https://interviewing\.io/blog/?$",
-            "scrape_type": "index_to_articles",
-            "link_selector": "a.blog-post-card-link", # Selector for individual blog post links on the index page
-            "content_type": "blog"
-        },
-        "blog_article": {
-            "url_pattern": r"https://interviewing\.io/blog/[^/]+/?$",
-            "scrape_type": "single_article",
-            "title_selector": "h1",
-            "content_selector": [".blog-post-content", "div.html-content", "div.markdown-content"], # Prioritized content selectors
-            "author_selector": ".author-name",
-            "content_type": "blog"
-        },
-        "topics_index": {
-            "url_pattern": r"https://interviewing\.io/topics/?$",
-            "scrape_type": "index_to_articles",
-            "link_selector": "#companies a.resource-card", # Selector for links within the 'companies' section
-            "content_type": "other" # Categorized as 'other' as it's a company guide, not a blog post
-        },
-        "learn_index": {
-            "url_pattern": r"https://interviewing\.io/learn/?$",
-            "scrape_type": "index_to_articles",
-            "link_selector": "#interview-guides a.resource-card", # Selector for links within the 'interview-guides' section
-            "content_type": "other" # Categorized as 'other' as it's an interview guide
-        },
-        "guide_article": {
-            "url_pattern": r"https://interviewing\.io/(?:topics|learn)/[^/]+/?$",
-            "scrape_type": "single_article",
-            "title_selector": "h1",
-            "content_selector": ["div.html-content", "div.markdown-content"],
-            "author_selector": None, # Authors not typically listed on these guides, so None
-            "content_type": "other"
-        }
-    },
-    "nilmamano.com": {
-        "dsa_blog_index": {
-            "url_pattern": r"https://nilmamano\.com/blog/category/dsa/?$",
-            "scrape_type": "index_to_articles",
-            "link_selector": "article h2.entry-title a", # Selector for article links on DSA blog category page
-            "content_type": "blog"
-        },
-        "dsa_blog_article": {
-            "url_pattern": r"https://nilmamano\.com/blog/[^/]+/[^/]+/?$", # Matches /blog/year/month/slug
-            "scrape_type": "single_article",
-            "title_selector": "h1.entry-title",
-            "content_selector": ".entry-content",
-            "author_selector": ".author",
-            "content_type": "blog"
-        }
-    },
-    "substack.com": { # Bonus: Substack support. Handles various substack authors.
-        "generic_post": {
-            "url_pattern": r"https://[a-zA-Z0-9-]+\.substack\.com/p/[^/]+/?$", # Matches any substack post
-            "scrape_type": "single_article",
-            "title_selector": "h1.post-title",
-            "content_selector": "div.html-content", # Common content wrapper for substack posts
-            "author_selector": ".byline-text",
-            "content_type": "blog"
-        }
-    },
-    "medium.com": { # Added for testing robustness with another popular platform
-        "article": {
-            "url_pattern": r"https://medium\.com/(@[\w\d-]+)?/[^/]+-[\w\d]+/?$", # Pattern for typical Medium articles
-            "scrape_type": "single_article",
-            "title_selector": "h1",
-            # Prioritized content selectors for Medium (try most specific first, then broader semantic tags)
-            "content_selector": ["div[data-testid='post-content']", "article", "div.pw-post-body-paragraph"],
-            "author_selector": "a[data-testid='authorName']", # A common selector for author name
-            "content_type": "blog"
-        }
-    },
-    "freecodecamp.org": { # Added for testing robustness
-        "news_article": {
-            "url_pattern": r"https://www\.freecodecamp\.org/news/[^/]+/?$",
-            "scrape_type": "single_article",
-            "title_selector": "h1.post-full-title",
-            "content_selector": "section.post-content",
-            "author_selector": "a.author-card-name",
-            "content_type": "blog"
-        }
-    },
-    "gitconnected.com": { # Added for testing robustness with another popular dev blog platform
-        "levelup_article": {
-            "url_pattern": r"https://levelup\.gitconnected\.com/[^/]+-[a-f0-9]+/?$", # Pattern for LevelUp articles
-            "scrape_type": "single_article",
-            "title_selector": "h1.entry-title",
-            "content_selector": "div.entry-content",
-            "author_selector": ".author-name a",
-            "content_type": "blog"
-        }
-    }
-}
+# Import the 'trafilatura' library for generic article extraction.
+# This is the core component that enables "no custom code" for websites.
+try:
+    import trafilatura
+except ImportError:
+    print("Error: 'trafilatura' library not found. Please install it by running: pip install trafilatura")
+    # Provide a dummy function to allow the script to be parsed even if the library isn't installed.
+    def trafilatura_extract(html, url, output_format, include_comments, include_links, include_formatting):
+        raise NotImplementedError("trafilatura not installed. Please install it via 'pip install trafilatura'")
+    def trafilatura_fetch_url(url):
+        raise NotImplementedError("trafilatura not installed. Please install it via 'pip install trafilatura'")
 
-# --- SECTION 2: HELPER FUNCTIONS FOR ROBUST SELECTOR APPLICATION ---
-# These functions abstract away the logic of trying multiple CSS selectors.
 
-def get_element_text(soup_obj, selectors):
+# --- SECTION 1: CORE HELPER FUNCTIONS ---
+# These functions perform fundamental tasks: fetching HTML, converting formats, and URL manipulation.
+
+def get_html_content_basic(url):
     """
-    Helper function to try a list of CSS selectors (or a single selector string)
-    on a BeautifulSoup object and return the stripped text of the first matching
-    element found. This improves robustness by trying alternatives if a primary
-    selector fails.
-    
-    Args:
-        soup_obj (BeautifulSoup): The BeautifulSoup object to search within.
-        selectors (str or list): A single CSS selector string or a list of
-                                 CSS selector strings to try.
-    
-    Returns:
-        str: The stripped text content of the first matching element,
-             or an empty string if no element matches any selector.
-    """
-    # If a list of selectors is provided, iterate through them
-    if isinstance(selectors, list):
-        for selector in selectors:
-            element = soup_obj.select_one(selector) # select_one finds the first match
-            if element:
-                return element.get_text(strip=True) # Return text if found
-    elif selectors: # If it's a single string selector (not a list)
-        element = soup_obj.select_one(selectors)
-        if element:
-            return element.get_text(strip=True)
-    return "" # Return empty string if no match found for any selector
-
-def get_element_html(soup_obj, selectors):
-    """
-    Helper function to try a list of CSS selectors (or a single selector string)
-    on a BeautifulSoup object and return the HTML content of the first matching
-    element found. Useful for extracting larger content blocks that will then
-    be converted to Markdown.
-    
-    Args:
-        soup_obj (BeautifulSoup): The BeautifulSoup object to search within.
-        selectors (str or list): A single CSS selector string or a list of
-                                 CSS selector strings to try.
-    
-    Returns:
-        str: The HTML content of the first matching element,
-             or an empty string if no element matches any selector.
-    """
-    if isinstance(selectors, list):
-        for selector in selectors:
-            element = soup_obj.select_one(selector)
-            if element:
-                return str(element) # Return HTML string if found
-    elif selectors:
-        element = soup_obj.select_one(selectors)
-        if element:
-            return str(element)
-    return ""
-
-# --- SECTION 3: GENERAL HELPER FUNCTIONS ---
-# These functions handle common tasks like fetching HTML, converting formats, and URL parsing.
-
-def get_html_content(url):
-    """
-    Fetches HTML content from a given URL using HTTP GET request.
-    Includes a User-Agent header to mimic a web browser and a longer timeout
-    for better robustness against slow server responses.
+    Fetches raw HTML content from a given URL using requests.
+    This is used as a fallback for `trafilatura.fetch_url` or specifically for
+    discovering links on index pages (where `trafilatura`'s full article extraction
+    isn't needed at this stage). Includes robust headers and timeouts.
     
     Args:
         url (str): The URL of the web page to fetch.
@@ -217,23 +42,24 @@ def get_html_content(url):
     """
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
         }
-        # Increased timeout to 30 seconds to handle slower website responses
         response = requests.get(url, headers=headers, timeout=30)
-        # Raise an HTTPError for bad responses (4xx or 5xx client/server errors)
-        response.raise_for_status()
+        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
         return response.text
     except requests.exceptions.RequestException as e:
-        # Catch any request-related exceptions (e.g., connection error, timeout, HTTP error)
-        print(f"Error fetching URL {url}: {e}")
+        print(f"Error fetching URL {url} with basic requests: {e}")
         return None
 
 def html_to_markdown(html_content):
     """
     Converts HTML content to a clean Markdown format.
-    Configured to preserve links and images and handle code blocks,
-    while removing excessive blank lines for better readability.
+    Used for both `trafilatura`'s extracted HTML and for fallback HTML content.
+    Ensures that the output content meets the 'Markdown content' requirement.
     
     Args:
         html_content (str): The HTML string to convert.
@@ -244,28 +70,28 @@ def html_to_markdown(html_content):
     if not html_content:
         return ""
     h = html2text.HTML2Text()
-    h.ignore_links = False     # Keep links in Markdown
-    h.ignore_images = False    # Keep image references
-    h.body_width = 0           # Disable line wrapping for content
-    h.unicode_snob = True      # Prefer unicode characters for symbols (e.g., bullet points)
-    h.skip_internal_links = True # Do not convert internal HTML links (e.g., #anchor-id)
-    h.wrap_links = False       # Do not wrap links in newlines
-    h.mark_code = True         # Attempt to identify and format code blocks
+    h.ignore_links = False
+    h.ignore_images = False
+    h.body_width = 0
+    h.unicode_snob = True
+    h.skip_internal_links = True
+    h.wrap_links = False
+    h.mark_code = True
     
     markdown = h.handle(html_content)
-    # Clean up excessive blank lines generated by html2text for cleaner output
-    markdown = re.sub(r'\n\s*\n', '\n\n', markdown)
+    markdown = re.sub(r'\n\s*\n', '\n\n', markdown) # Clean up excessive blank lines
     return markdown.strip()
 
 def extract_text_from_pdf(pdf_file_path):
     """
-    Extracts text content from a PDF file using PyPDF2.
+    Extracts plain text content from a PDF file using PyPDF2.
+    Handles the ingestion of PDF documents, fulfilling the 'Aline's Book' requirement.
     
     Args:
         pdf_file_path (str): The path to the PDF file.
         
     Returns:
-        str or None: The extracted text content as a string, or None if an error occurs.
+        str or None: The extracted text content, or None if an error occurs.
     """
     text = ""
     try:
@@ -278,317 +104,306 @@ def extract_text_from_pdf(pdf_file_path):
         print(f"Error extracting text from PDF {pdf_file_path}: {e}")
         return None
 
-def get_domain(url):
+def get_base_domain(url):
     """
-    Extracts the normalized domain from a URL.
-    This function is crucial for matching URLs to the `WEBSITE_CONFIG`
-    even if they use subdomains (e.g., 'user.substack.com' should map to 'substack.com').
+    Extracts the base domain from a URL, normalizing for common subdomains.
+    This is used for filtering links to ensure we stay within the intended website
+    or its relevant subdomains during link discovery.
     
     Args:
         url (str): The URL string.
         
     Returns:
-        str: The normalized domain (e.g., "example.com").
+        str: The normalized base domain (e.g., "example.com").
     """
     parsed_uri = urlparse(url)
-    netloc = parsed_uri.netloc.replace('www.', '') # Remove 'www.' for consistency
+    netloc = parsed_uri.netloc.replace('www.', '') # Remove 'www.'
     
-    # Special handling for common platforms with dynamic subdomains
+    # Generic normalization for common blog/publishing platforms
     if netloc.endswith('.substack.com'):
         return 'substack.com'
     if netloc.endswith('.medium.com'):
         return 'medium.com'
     if netloc.endswith('.gitconnected.com'):
         return 'gitconnected.com'
+    if netloc.endswith('.freecodecamp.org'):
+        return 'freecodecamp.org'
+    if netloc.endswith('.hubspot.com'): # For blog.hubspot.com
+        return 'hubspot.com'
 
     return netloc
 
-def match_url_to_config(url):
+# --- SECTION 2: WEB ARTICLE EXTRACTION (GENERIC & RULE-FREE) ---
+# This is where `trafilatura` shines, eliminating site-specific CSS selectors.
+
+def scrape_web_article_generic(url):
     """
-    Attempts to match a given URL to a corresponding configuration
-    in the `WEBSITE_CONFIG` dictionary.
+    Generically scrapes a web article using the `trafilatura` library.
+    This function implements the "no custom code, no rules" principle for web content extraction.
+    `trafilatura` automatically downloads, parses, and extracts the main content, title, authors,
+    and other metadata from virtually any given article URL using advanced heuristics.
     
     Args:
-        url (str): The URL to match.
+        url (str): The URL of the web page to scrape.
         
     Returns:
-        tuple: A tuple containing (domain, config_key, config_details)
-               if a match is found, otherwise (None, None, None).
+        dict or None: A dictionary containing the scraped data
+                      (title, content in Markdown, author, source_url, content_type='blog')
+                      or None if scraping fails.
     """
-    domain = get_domain(url)
-    if domain in WEBSITE_CONFIG:
-        # Iterate through all configurations for that domain
-        for config_key, config_details in WEBSITE_CONFIG[domain].items():
-            # Check if the URL matches the defined regex pattern for this specific page type
-            if re.match(config_details["url_pattern"], url):
-                return domain, config_key, config_details
-    return None, None, None # No matching configuration found
+    try:
+        # trafilatura.fetch_url handles downloading with good defaults (user-agent, retries)
+        downloaded_html = trafilatura.fetch_url(url)
+        
+        if not downloaded_html:
+            print(f"Trafilatura failed to download HTML for {url}. Skipping this URL.")
+            return None # Cannot proceed without HTML content
 
-# --- SECTION 4: MAIN SCRAPING LOGIC FUNCTIONS ---
-# These functions implement the core logic for scraping single articles and index pages.
+        # Use trafilatura.extract to get the main content and metadata.
+        # output_format='json' is ideal as it gives us structured data directly.
+        extracted_json_str = trafilatura.extract(
+            downloaded_html,
+            url=url, # Provide URL for better context for trafilatura's internal logic
+            output_format='json',
+            include_comments=False,    # Usually don't want comments in main article content
+            include_links=True,        # Preserve links within the content
+            include_formatting=True    # Preserve bold, italics, etc.
+        )
 
-def scrape_single_article(url, config_details):
+        if not extracted_json_str:
+            print(f"Trafilatura extracted no article data from {url}. Content might not be an article or site blocks extraction.")
+            return None # If trafilatura finds no article, it's not an article for our purpose
+
+        # Parse the JSON string into a Python dictionary
+        parsed_data = json.loads(extracted_json_str)
+
+        # Map trafilatura's output to the desired JSON format
+        title = parsed_data.get("title", os.path.basename(urlparse(url).path.strip('/')) or url)
+        authors = parsed_data.get("author", "Unknown")
+        # trafilatura's 'text' field is often already clean or Markdown-like.
+        # We pass it through html_to_markdown for consistency and extra cleanup.
+        content_markdown = html_to_markdown(parsed_data.get("text", ""))
+
+        return {
+            "title": title,
+            "content": content_markdown,
+            "content_type": "blog", # Default for generic web articles
+            "source_url": url,
+            "author": authors,
+            "user_id": "" # Placeholder: will be filled by `run_scraper_tool`
+        }
+
+    except Exception as e:
+        print(f"An error occurred during generic web scraping for {url} with Trafilatura: {e}")
+        return None
+
+# --- SECTION 3: GENERIC LINK DISCOVERY (FOR "EVERY BLOG POST") ---
+# This section enables the scraper to find and process multiple articles from index pages.
+
+def get_all_links_from_page(url, base_domain):
     """
-    Scrapes content from a single article page based on the provided configuration.
-    It uses the robust `get_element_text` and `get_element_html` helpers.
+    Generically discovers all internal article-like links from a given web page.
+    This function performs the "crawling" aspect, identifying URLs that likely
+    point to individual articles. It's generic, relying on basic HTML parsing
+    and URL heuristics, NOT site-specific CSS selectors for link identification.
     
     Args:
-        url (str): The URL of the article to scrape.
-        config_details (dict): The specific configuration dictionary for this page type.
-        
+        url (str): The URL of the page (e.g., a blog index) to extract links from.
+        base_domain (str): The normalized base domain of the current scraping session
+                           to filter for internal links.
+                           
     Returns:
-        dict or None: A dictionary containing the scraped data in the desired
-                      JSON format, or None if the HTML content could not be fetched.
+        set: A set of unique, absolute URLs that are potential article links.
     """
-    html_content = get_html_content(url)
+    html_content = get_html_content_basic(url)
     if not html_content:
-        return None # Cannot proceed without HTML content
+        return set() # Return empty set if page can't be fetched
 
     soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # Initialize the item data structure
-    item_data = {
-        "title": "Untitled", # Default title
-        "content": "",
-        "content_type": config_details.get("content_type", "other"),
-        "source_url": url,
-        "author": "",
-        "user_id": "" # Placeholder, filled by `run_scraper_tool`
-    }
+    found_urls = set()
 
-    # 1. Extract Title: Use the robust helper to find the title
-    item_data["title"] = get_element_text(soup, config_details.get("title_selector", ""))
-    if not item_data["title"]:
-        print(f"Warning: No title found for {url} with selectors {config_details.get('title_selector')}")
-        # Fallback: Use URL path segment as title if no title element found
-        item_data["title"] = os.path.basename(urlparse(url).path.strip('/')) or url
+    # Find all anchor (<a>) tags on the page
+    for link_tag in soup.find_all('a', href=True):
+        href = link_tag['href']
+        full_url = urljoin(url, href) # Resolve relative URLs
 
-    # 2. Extract Content: Get the HTML of the content section, then convert to Markdown
-    content_html = get_element_html(soup, config_details.get("content_selector", ""))
-    if content_html:
-        item_data["content"] = html_to_markdown(content_html)
-    else:
-        print(f"Warning: No content found for {url} with selectors {config_details.get('content_selector')}")
-
-    # 3. Extract Author: Use the robust helper to find the author
-    item_data["author"] = get_element_text(soup, config_details.get("author_selector", ""))
-
-    return item_data
-
-def scrape_index_page_and_articles(url, config_details):
-    """
-    Scrapes an index page (e.g., a blog category page), finds links to individual articles
-    on that page, and then proceeds to scrape each linked article.
-    
-    Args:
-        url (str): The URL of the index page to scrape.
-        config_details (dict): The configuration for this index page type.
-        
-    Returns:
-        list: A list of dictionaries, where each dictionary represents a scraped article.
-    """
-    print(f"Scraping index page: {url}")
-    html_content = get_html_content(url)
-    if not html_content:
-        return [] # Cannot proceed without HTML content
-
-    soup = BeautifulSoup(html_content, 'html.parser')
-    scraped_items = []
-    
-    # Find all potential article links on the index page using the link_selector
-    links = soup.select(config_details.get("link_selector", ""))
-    
-    # Use a set to keep track of processed URLs and avoid duplicate scraping
-    processed_urls = set()
-
-    for link_tag in links:
-        href = link_tag.get('href')
-        if not href:
-            continue # Skip if no href attribute
-
-        # Resolve relative URLs (e.g., "/blog/my-post" to "https://example.com/blog/my-post")
-        full_url = urljoin(url, href)
-        
-        # Basic validation: ensure it's a valid HTTP/HTTPS URL and not just a page fragment or internal link
+        # Basic filtering to ensure it's a valid HTTP(S) link and not a fragment
         if not full_url.startswith(('http://', 'https://')):
             continue
+        if '#' in full_url and not full_url.startswith(url + '#'): # Allow internal anchors on same page
+            continue # Skip fragment links that aren't on the same page
 
-        # Avoid processing the same URL multiple times (important for robustness)
-        if full_url in processed_urls:
+        # Crucial: Filter for links that stay within the same base domain or a relevant subdomain.
+        # This prevents the crawler from spiraling out to unrelated websites.
+        link_domain = get_base_domain(full_url)
+        if link_domain != base_domain:
+            continue # Skip external links
+
+        # Further simple heuristic: Exclude common non-article file extensions.
+        # This is generic and helps avoid media files, zips, etc.
+        if re.search(r'\.(pdf|docx|xlsx|zip|rar|tar|gz|jpg|jpeg|png|gif|svg|mp3|mp4|avi|mov)$', full_url, re.IGNORECASE):
             continue
-        processed_urls.add(full_url)
-        
-        # Match the found full URL to an article configuration (e.g., blog_article, guide_article)
-        _, _, article_config = match_url_to_config(full_url)
-        
-        # If a matching single_article configuration is found, scrape it
-        if article_config and article_config["scrape_type"] == "single_article":
-            print(f"  -> Scraping linked article: {full_url}")
-            article_data = scrape_single_article(full_url, article_config)
-            if article_data:
-                scraped_items.append(article_data)
-            time.sleep(0.5) # Be polite: pause briefly between requests to the same domain
-        else:
-            # Inform if a link is skipped because it's not a configured article type
-            print(f"  -> Skipping non-article link or unconfigured URL: {full_url}")
 
-    return scraped_items
+        # More refined path filtering: Try to avoid common navigational/non-article paths.
+        # This is a generic heuristic, not specific to any site's design.
+        parsed_link_path = urlparse(full_url).path.lower()
+        if (parsed_link_path.endswith('/') and len(parsed_link_path.strip('/')) < 5) or \
+           '/category/' in parsed_link_path or \
+           '/tag/' in parsed_link_path or \
+           '/archive/' in parsed_link_path or \
+           '/about' in parsed_link_path or \
+           '/contact' in parsed_link_path or \
+           '/privacy' in parsed_link_path:
+           continue
 
-def process_url(url):
-    """
-    Determines the type of URL (single article or index page) and
-    initiates the appropriate scraping process based on `WEBSITE_CONFIG`.
-    
-    Args:
-        url (str): The URL to process.
-        
-    Returns:
-        list: A list of scraped item dictionaries. Returns an empty list
-              if no configuration is found or scraping fails.
-    """
-    # Try to match the URL to one of the predefined configurations
-    domain, config_key, config_details = match_url_to_config(url)
-    
-    if not config_details:
-        print(f"Error: No specific scraping configuration found for URL: {url}")
-        # For this assignment, we choose to return an empty list if not explicitly configured.
-        # This signals that the tool understands the URL but doesn't know how to parse it.
-        return [] 
 
-    # Based on the scrape_type in the matched configuration, call the appropriate scraper function
-    if config_details["scrape_type"] == "single_article":
-        item = scrape_single_article(url, config_details)
-        return [item] if item else [] # Return a list containing the single item, or an empty list
-    elif config_details["scrape_type"] == "index_to_articles":
-        return scrape_index_page_and_articles(url, config_details)
-    else:
-        # Should not be reached if config_details are well-defined
-        print(f"Unknown scrape_type: {config_details['scrape_type']} for URL: {url}")
-        return []
+        found_urls.add(full_url) # Add the filtered, absolute URL
 
-# --- SECTION 5: GRADIO INTERFACE FUNCTIONS & DEFINITION ---
-# This section sets up the web UI using Gradio and orchestrates the overall scraping process.
+    return found_urls
+
+# --- SECTION 4: GRADIO INTERFACE FUNCTIONS & DEFINITION ---
+# This section sets up the web UI using Gradio and orchestrates the overall
+# data ingestion process based on user inputs.
 
 def run_scraper_tool(team_id, user_id, urls_input, pdf_file_obj):
     """
-    The main function that acts as the backend for the Gradio interface.
-    It takes user inputs (team ID, user ID, URLs, PDF file) and orchestrates
-    the scraping and processing to generate the final JSON output.
+    The main function for the Gradio interface. It manages a queue of URLs
+    to process, handling both direct article URLs and index pages (by
+    discovering links from them). All content is extracted generically.
     
     Args:
-        team_id (str): The team identifier for the output JSON.
-        user_id (str): The user identifier for the output JSON.
-        urls_input (str): A comma-separated string of URLs to scrape.
-        pdf_file_obj (gradio.inputs.File or None): Object representing the uploaded PDF file.
-                                                    Contains .name attribute for the temporary file path.
+        team_id (str): The team identifier provided by the user.
+        user_id (str): The user identifier for attributing scraped items.
+        urls_input (str): A comma-separated string of initial URLs to scrape.
+        pdf_file_obj (gradio.inputs.File or None): Gradio file object representing an uploaded PDF.
                                                     
     Returns:
         dict: The final output JSON structure containing all scraped items.
     """
     final_output = {
-        "team_id": team_id if team_id else "default_team_id", # Use provided team_id or a default
+        "team_id": team_id if team_id else "default_team_id",
         "items": []
     }
     
-    scraped_count = 0 # Counter for successfully scraped items
+    # Use a deque for efficient appends/pops (queue-like behavior)
+    url_queue = deque()
+    # Keep track of URLs that have been added to the queue OR already processed
+    processed_urls = set() 
+    
+    scraped_count = 0
 
-    # Process Web URLs (if provided)
+    # 1. Add initial URLs to the queue
     if urls_input:
-        # Split the comma-separated string into a list of URLs and clean whitespace
-        urls = [u.strip() for u in urls_input.split(',') if u.strip()]
-        for url in urls:
-            print(f"Processing URL: {url}")
-            try:
-                # Call the core URL processing logic
-                items = process_url(url)
-                for item in items:
-                    if item: # Ensure the item dictionary is not None
-                        item["user_id"] = user_id if user_id else "default_user" # Assign the user_id
-                        final_output["items"].append(item)
-                        scraped_count += 1
-            except Exception as e:
-                # Catch any unexpected errors during URL processing
-                print(f"An error occurred while processing URL {url}: {e}")
-            time.sleep(1) # Polite delay between processing different top-level URLs
+        initial_urls = [u.strip() for u in urls_input.split(',') if u.strip()]
+        for url in initial_urls:
+            if url.startswith(('http://', 'https://')) and url not in processed_urls:
+                url_queue.append(url)
+                processed_urls.add(url)
+            else:
+                print(f"Skipping invalid or duplicate initial URL: {url}")
 
-    # Process PDF File (if uploaded)
+    # 2. Process URLs from the queue
+    while url_queue:
+        current_url = url_queue.popleft() # Get the next URL from the front of the queue
+        print(f"Processing URL: {current_url}")
+        
+        # Determine the base domain for link discovery
+        current_base_domain = get_base_domain(current_url)
+
+        try:
+            # First, try to scrape it as a generic article using Trafilatura
+            item = scrape_web_article_generic(current_url)
+            
+            if item:
+                # If Trafilatura successfully extracted an article, add it to output
+                item["user_id"] = user_id if user_id else "default_user"
+                final_output["items"].append(item)
+                scraped_count += 1
+                print(f"  -> Successfully scraped: {item['title']} from {current_url}")
+            else:
+                # If Trafilatura did NOT find an article (e.g., it's an index page, or site blocked it)
+                # Then, attempt to discover links from this page
+                print(f"  -> Trafilatura found no article. Attempting generic link discovery from: {current_url}")
+                discovered_links = get_all_links_from_page(current_url, current_base_domain)
+                
+                # Add newly discovered, unprocessed links to the queue
+                for link in discovered_links:
+                    if link not in processed_urls:
+                        url_queue.append(link)
+                        processed_urls.add(link)
+                        print(f"    -> Discovered link: {link}")
+            
+        except Exception as e:
+            print(f"An unhandled error occurred while processing URL {current_url}: {e}")
+            
+        time.sleep(1) # Be polite: pause briefly between processing different URLs
+
+    # 3. Process PDF File (if uploaded)
     if pdf_file_obj:
         print(f"Processing PDF file: {pdf_file_obj.name}")
         pdf_content = extract_text_from_pdf(pdf_file_obj.name)
         if pdf_content:
-            # Generate a title from the PDF filename
             pdf_title = os.path.basename(pdf_file_obj.name).replace(".pdf", "").replace("_", " ").title()
             final_output["items"].append({
-                "title": f"{pdf_title} (Book Chapters)", # Indicate it's from the book
+                "title": f"{pdf_title} (Book Chapters)",
                 "content": pdf_content,
                 "content_type": "book",
-                "source_url": "Aline's Book (Google Drive)", # As per problem description
-                "author": "Aline", # Assumed author, could be made configurable if needed
-                "user_id": user_id if user_id else "default_user" # Assign the user_id
+                "source_url": "Aline's Book (Google Drive)",
+                "author": "Aline",
+                "user_id": user_id if user_id else "default_user"
             })
             scraped_count += 1
+            print(f"  -> Successfully processed PDF: {pdf_title}")
         else:
             print(f"Could not extract content from PDF: {pdf_file_obj.name}")
 
     print(f"Scraping complete. Total items scraped: {scraped_count}")
-    return final_output # Return the accumulated JSON output
+    return final_output
 
-# Define the Gradio interface
-# This creates the UI elements and links them to the `run_scraper_tool` function.
+# Define the Gradio interface layout and behavior
 iface = gr.Interface(
-    fn=run_scraper_tool, # The Python function to call when the user interacts with the UI
+    fn=run_scraper_tool,
     inputs=[
         gr.Textbox(
             label="Team ID",
             placeholder="e.g., aline123 (Required)",
-            value="aline123" # Pre-fill for convenience during demo
+            value="aline123"
         ),
         gr.Textbox(
             label="User ID (for scraped items)",
             placeholder="e.g., aline, jane_smith, my_team_member",
-            value="aline" # Default to 'aline' for original problem context, but editable
+            value="aline"
         ),
         gr.Textbox(
             label="URLs to Scrape (Comma-separated)",
             placeholder="""
-            Example URLs (try these to showcase robustness!):
-            - Medium: https://medium.com/datawookie/web-scraping-with-python-and-beautiful-soup-c7ad2a234509
-            - freeCodeCamp: https://www.freecodecamp.org/news/learn-javascript-for-beginners/
-            - Substack: https://jessmartin.substack.com/p/the-importance-of-side-projects
-            - LevelUp GitConnected: https://levelup.gitconnected.com/when-elegant-code-leads-to-untraceable-bugs-a-case-study-in-abstraction-8af2b117ecca
+            Enter URLs here. This can be:
+            - **Direct Article Links:** e.g., https://medium.com/@datawookie/web-scraping-with-python-and-beautiful-soup-c7ad2a234509
+            - **Blog/Category Index Pages:** The tool will discover articles from these.
+              e.g., https://interviewing.io/blog, https://nilmamano.com/blog/category/dsa
+            - **Other Example Articles (current as of June 2025):**
+              - freeCodeCamp: https://www.freecodecamp.org/news/how-to-code-snake-game-javascript/
+              - Substack: https://jessmartin.substack.com/p/building-an-ai-powered-search-engine
+              - TechCrunch: https://techcrunch.com/2024/06/18/eu-launches-ai-office-to-implement-ai-act-and-drive-global-collaboration/
+              - The Verge: https://www.theverge.com/2024/6/18/24180424/apple-wwdc-2024-ai-iphone-ios-18-mac-features-takeaways (Note: NyTimes often blocks)
+              - Wired: https://www.wired.com/story/apple-ai-intelligence-ios-18-macos-sonoma-privacy/
             """,
-            lines=8 # Allows multiple lines for easier input of many URLs
+            lines=8
         ),
         gr.File(
             label="Upload PDF Book (Optional - First 8 Chapters)",
-            type="filepath", # Gradio handles the file upload and provides a temporary path
-            file_types=[".pdf"] # Restrict uploads to PDF files
+            type="filepath",
+            file_types=[".pdf"]
         )
     ],
-    outputs=gr.JSON(label="Scraped Data Output (JSON)"), # Output component to display the JSON result
-    title="📚 Knowledgebase Scraper for Technical Content 🤖", # Title of the Gradio application
+    outputs=gr.JSON(label="Scraped Data Output (JSON)"),
+    title="📚 Knowledgebase Scraper: Truly Scalable & Rule-Free Content Ingestion �",
     description="""
-    This tool scrapes technical content from specified URLs (blogs, guides, Substack, Medium, freeCodeCamp)
-    and PDF files, converting it into a structured JSON format.
-    <br>
-    <!-- HTML for detailed explanation of robustness and extensibility directly in the Gradio description -->
-    <div style="padding: 15px; border: 1px solid #ccc; border-radius: 8px; margin-top: 15px; background-color: #f9f9f9;">
-        <h4 style="color: #333; margin-top: 0;">On Robustness & Extensibility (Key Design Principles):</h4>
-        <p style="color: #555;">
-            The scraper's design prioritizes **reusability and adaptability**. The <code>WEBSITE_CONFIG</code> dictionary is key to this:
-            <ul>
-                <li><strong>Configuration-Driven:</strong> Each website has its own set of rules (URL patterns, content types, CSS selectors). Adding support for a new website simply means adding a new entry to this dictionary, without needing to modify the core scraping logic. This enables rapid expansion for future customers.</li>
-                <li><strong>Robust Selectors (Lists of Selectors):</strong> For critical elements like <code>title</code>, <code>content</code>, and <code>author</code>, you can now provide a <strong>list of CSS selectors</strong>. The scraper will try them in order until one matches. This makes the tool significantly more resilient to minor website layout changes over time. If a class name changes, an alternative selector can still work, preventing immediate breakage.</li>
-                <li><strong>Semantic & Broad Selectors:</strong> Whenever possible, we aim for general HTML tags (e.g., <code>&lt;article&gt;</code>, <code>&lt;h1&gt;</code>) or stable HTML attributes like <code>id</code>. These are generally less prone to change than highly specific or auto-generated class names, enhancing long-term stability.</li>
-                <li><strong>Domain Normalization:</strong> The tool intelligently normalizes domain names (e.g., mapping <code>user.substack.com</code> to <code>substack.com</code> or <code>blog.medium.com</code> to <code>medium.com</code>). This means one configuration entry can cover many subdomains of a popular platform.</li>
-            </ul>
-            This modular, configuration-driven approach allows for efficient development, rapid adaptation to new content sources, and graceful handling of website updates.
-        </p>
-    </div>
+
     """
 )
 
-# --- SECTION 6: APPLICATION ENTRY POINT ---
+# --- SECTION 5: APPLICATION ENTRY POINT ---
 # This block ensures the Gradio interface launches when the script is run directly.
 if __name__ == "__main__":
     iface.launch(debug=True) # `debug=True` provides more verbose output in the console
